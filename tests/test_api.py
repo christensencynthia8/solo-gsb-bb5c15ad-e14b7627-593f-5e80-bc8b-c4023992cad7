@@ -280,3 +280,94 @@ def test_gpu_usage_empty_database_zeros(client):
     body = r.json()
     assert body["tenants"] == []
     assert body["global"] == {"gpu_minutes": 0.0, "overlapping_jobs": 0}
+
+
+def test_tenant_gpu_cap_flow_via_http(client):
+    # Create tenant with a 2-GPU concurrent cap.
+    r = client.post("/tenants", json={
+        "tenant_id": "team-a", "weight": 1, "max_gpus": 2})
+    assert r.status_code == 201, r.text
+    assert r.json()["max_gpus"] == 2
+    assert r.json()["running_gpus"] == 0
+
+    j1 = client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 2, "duration_min": 5}).json()["id"]
+    j2 = client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 1, "duration_min": 5}).json()["id"]
+
+    # J1 fills the cap; J2 waits and earns no quantum.
+    body = client.post("/scheduler/batch").json()
+    assert body["selection_order"] == [j1]
+    tenants = {t["id"]: t for t in body["tenants"]}
+    assert tenants["team-a"]["running_gpus"] == 2
+    assert tenants["team-a"]["max_gpus"] == 2
+
+    # J1 fills the cap; J2 waits and earns no quantum. (Aging may still land,
+    # exactly as it does for a capacity-blocked head.)
+    body = client.post("/scheduler/batch").json()
+    assert body["selection_order"] == []
+    assert all(e["kind"] != "QUANTUM" for e in body["events"])
+
+    # Re-running the batch while cap-blocked still hands out no quantum.
+    body = client.post("/scheduler/batch").json()
+    assert body["selection_order"] == []
+    assert all(e["kind"] != "QUANTUM" for e in body["events"])
+
+    # Completion releases cap headroom; J2 runs.
+    assert client.post(f"/jobs/{j1}/complete").status_code == 200
+    body = client.post("/scheduler/batch").json()
+    assert body["selection_order"] == [j2]
+
+    # Clear the cap explicitly with null; GET reflects unlimited.
+    r = client.post("/tenants", json={
+        "tenant_id": "team-a", "weight": 1, "max_gpus": None})
+    assert r.status_code == 201
+    assert r.json()["max_gpus"] is None
+
+    r = client.get("/tenants/team-a")
+    assert r.json()["max_gpus"] is None
+
+
+def test_tenant_cap_omitted_preserves_existing_cap(client):
+    assert client.post("/tenants", json={
+        "tenant_id": "team-a", "weight": 1, "max_gpus": 3}).status_code == 201
+    # Update weight without sending max_gpus: cap is preserved.
+    r = client.post("/tenants", json={
+        "tenant_id": "team-a", "weight": 2})
+    assert r.status_code == 201
+    body = r.json()
+    assert body["weight"] == 2.0 and body["max_gpus"] == 3
+
+
+def test_tenant_cap_does_not_starve_other_tenants_http(client):
+    client.post("/tenants", json={
+        "tenant_id": "team-a", "weight": 1, "max_gpus": 2})
+    ja1 = client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 2, "duration_min": 5}).json()["id"]
+    client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 2, "duration_min": 5})
+    jb = client.post("/jobs", json={
+        "tenant_id": "team-b", "gpus": 4, "duration_min": 5}).json()["id"]
+
+    # a's cap stops at 2 GPUs, but b still gets its 4 (2 + 4 <= 8).
+    body = client.post("/scheduler/batch").json()
+    assert body["selection_order"] == [ja1, jb]
+    used = {t["id"]: t["running_gpus"] for t in body["tenants"]}
+    assert used["team-a"] == 2 and used["team-b"] == 4
+
+
+def test_tenant_cap_validation_http(client):
+    # max_gpus must be a positive integer.
+    r = client.post("/tenants", json={
+        "tenant_id": "x", "weight": 1, "max_gpus": 0})
+    assert r.status_code == 422
+    r = client.post("/tenants", json={
+        "tenant_id": "x", "weight": 1, "max_gpus": -2})
+    assert r.status_code == 422
+    # Booleans must not be coerced into an integer cap.
+    r = client.post("/tenants", json={
+        "tenant_id": "x", "weight": 1, "max_gpus": True})
+    assert r.status_code == 422
+    # New tenant without the field is unlimited (default behaviour).
+    r = client.post("/tenants", json={"tenant_id": "y", "weight": 1})
+    assert r.status_code == 201 and r.json()["max_gpus"] is None

@@ -204,6 +204,88 @@ def main() -> int:
         {"id": p3["id"], "status": "CANCELLED"}]
     print("case 7 dependencies + blocked_by OK")
 
+    # --- Case 8: per-tenant concurrent GPU caps ---------------------------
+    db.reset_for_tests()
+    db.connect(":memory:")
+    t = scheduler.upsert_tenant("a", 1.0, max_gpus=2)
+    assert t["max_gpus"] == 2 and t["running_gpus"] == 0
+    submit("a", 2, 10, 1.0, iso(0))  # J1 exactly fills the cap
+    submit("a", 1, 10, 1.0, iso(1))  # J2 cap-blocked after J1
+    j3 = submit("b", 4, 10, 1.0, iso(2))  # unlimited tenant still runs
+    r = scheduler.run_batch(now=at(3))
+    assert r["selection_order"] == ["J000001", "J000003"], r["selection_order"]
+    assert scheduler.get_tenant("a")["running_gpus"] == 2
+    # Cap-blocked head earns no quantum this round.
+    blocked = scheduler.run_batch(now=at(3))
+    assert blocked["selection_order"] == []
+    assert all(
+        e["kind"] != "QUANTUM" for e in blocked["events"]
+        if e["tenant_id"] == "a"
+    )
+    # Completing releases cap headroom; J2 dispatches.
+    scheduler.complete_job("J000001")
+    scheduler.complete_job(j3["id"])
+    r2 = scheduler.run_batch(now=at(4))
+    assert r2["selection_order"] == ["J000002"], r2["selection_order"]
+    # Omit keeps the cap; explicit None clears it.
+    assert scheduler.upsert_tenant("a", 2.0)["max_gpus"] == 2
+    assert scheduler.upsert_tenant("a", 2.0, max_gpus=None)["max_gpus"] is None
+    print("case 8 per-tenant GPU caps OK")
+
+    # --- Case 9: legacy database without tenants.max_gpus migrates --------
+    import sqlite3
+    legacy = os.path.join(tempfile.gettempdir(), "legacy_scheduler.db")
+    if os.path.exists(legacy):
+        os.remove(legacy)
+    lc = sqlite3.connect(legacy)
+    lc.executescript(
+        """
+        CREATE TABLE tenants (
+            id TEXT PRIMARY KEY, weight REAL NOT NULL, deficit REAL NOT NULL
+                DEFAULT 0, aging_settled_at TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL,
+            now_ref TEXT NOT NULL, capacity_gpus INTEGER NOT NULL,
+            used_gpus_before INTEGER NOT NULL, available_gpus INTEGER NOT NULL,
+            rounds INTEGER NOT NULL, jobs_selected INTEGER NOT NULL);
+        CREATE TABLE jobs (
+            id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, gpus INTEGER NOT NULL,
+            duration_min INTEGER NOT NULL, cost_gpu_min REAL NOT NULL,
+            status TEXT NOT NULL, queued_at TEXT NOT NULL, scheduled_at TEXT,
+            completed_at TEXT, batch_id INTEGER, run_index INTEGER);
+        CREATE TABLE job_dependencies (
+            job_id TEXT NOT NULL, depends_on TEXT NOT NULL,
+            PRIMARY KEY (job_id, depends_on));
+        CREATE TABLE ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL,
+            batch_id INTEGER, job_id TEXT, kind TEXT NOT NULL,
+            amount REAL NOT NULL, balance_after REAL NOT NULL,
+            detail TEXT, created_at TEXT NOT NULL);
+        """
+    )
+    lc.execute(
+        "INSERT INTO tenants (id, weight, deficit, created_at, updated_at) "
+        "VALUES ('old', 1.0, 0, ?, ?)",
+        (iso(0), iso(0)),
+    )
+    lc.execute(
+        "INSERT INTO jobs (id, tenant_id, gpus, duration_min, cost_gpu_min, "
+        "status, queued_at) VALUES ('J000001', 'old', 8, 1, 8, 'QUEUED', ?)",
+        (iso(0),),
+    )
+    lc.commit()
+    lc.close()
+    db.reset_for_tests()
+    db.connect(legacy)
+    assert scheduler.get_tenant("old")["max_gpus"] is None
+    r = scheduler.run_batch(now=at(5))
+    assert r["selection_order"] == ["J000001"]
+    assert scheduler.upsert_tenant("new", 1.0, max_gpus=4)["max_gpus"] == 4
+    db.reset_for_tests()
+    os.remove(legacy)
+    print("case 9 legacy schema migration OK")
+
     print("\nALL CORE CHECKS PASSED")
     return 0
 

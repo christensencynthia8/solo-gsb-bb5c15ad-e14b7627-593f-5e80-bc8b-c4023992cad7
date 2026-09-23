@@ -18,9 +18,24 @@ WDRR per batch
 1. Each active tenant (one with QUEUED jobs, tenant id order) receives
    ``base_quantum * weight`` GPU-minutes of credit every DRR round.
 2. Visiting tenants in fixed order, the head-of-line job is dispatched when
-   ``balance >= job_cost`` AND enough free GPUs exist.
+   ``balance >= job_cost`` AND enough free GPUs exist AND the tenant's own
+   concurrent-GPU cap (optional ``max_gpus``) still has room.
 3. A full round in which nothing is dispatched ends the batch: blocked jobs
    keep their credit, and a later batch (after completions or aging) retries.
+
+Per-tenant GPU caps
+===================
+A tenant may carry an optional ``max_gpus`` cap on concurrently allocated
+GPUs (NULL = unlimited, the default for old and auto-registered tenants).
+A head job fits only when ``running_gpus + head_gpus <= max_gpus`` in
+addition to fitting the cluster's free capacity. A cap-blocked tenant — its
+RUNNING jobs already fill the cap, or its head job alone exceeds the cap —
+receives no QUANTUM for that round (so the endpoint cannot be farmed), but
+other tenants in the same round are unaffected and still dispatch. Aging
+compensation for cap-blocked tenants works exactly as for capacity-blocked
+ones, bounding starvation. Completing or cancelling a RUNNING job releases
+the GPUs against the cap immediately. Caps are set/cleared through
+``POST /tenants``; submitting a job never changes an existing cap.
 
 Aging compensation
 ==================
@@ -232,16 +247,35 @@ def _find_cycle(
 # Tenants
 # ---------------------------------------------------------------------------
 
+# Sentinel for upsert_tenant: no max_gpus argument was supplied, so an
+# existing tenant keeps its current cap (and a new tenant gets unlimited).
+UNSET = object()
+
+
 def upsert_tenant(
     tenant_id: str,
     weight: float,
+    max_gpus: int | None | object = UNSET,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
-    """Create a tenant or update its weight. Existing balances are retained."""
+    """Create a tenant or update its weight (and optionally its GPU cap).
+
+    Existing balances are retained. ``max_gpus`` accepts a positive integer to
+    set the cap, ``None`` to clear it, or may be omitted to leave an existing
+    tenant's cap untouched.
+    """
     if not tenant_id or not tenant_id.strip():
         raise SchedulerError("tenant_id must be a non-empty string")
     if weight <= 0:
         raise SchedulerError("weight must be > 0")
+    if max_gpus is not UNSET:
+        # bool is a subclass of int and must not be accepted.
+        if max_gpus is not None and (
+            not isinstance(max_gpus, int)
+            or isinstance(max_gpus, bool)
+            or max_gpus <= 0
+        ):
+            raise SchedulerError("max_gpus must be a positive integer or null")
     settings = settings or get_settings()
     now = _now_iso()
     with db.get_lock(), db.get_conn():
@@ -253,16 +287,27 @@ def upsert_tenant(
         if existing is None:
             conn.execute(
                 """INSERT INTO tenants
-                       (id, weight, deficit, aging_settled_at,
+                       (id, weight, deficit, max_gpus, aging_settled_at,
                         created_at, updated_at)
-                   VALUES (?, ?, 0, NULL, ?, ?)""",
-                (tenant_id, float(weight), now, now),
+                   VALUES (?, ?, 0, ?, NULL, ?, ?)""",
+                (
+                    tenant_id,
+                    float(weight),
+                    (None if max_gpus is UNSET else max_gpus),
+                    now,
+                    now,
+                ),
             )
         else:
             conn.execute(
                 "UPDATE tenants SET weight = ?, updated_at = ? WHERE id = ?",
                 (float(weight), now, tenant_id),
             )
+            if max_gpus is not UNSET:
+                conn.execute(
+                    "UPDATE tenants SET max_gpus = ? WHERE id = ?",
+                    (max_gpus, tenant_id),
+                )
         return get_tenant(tenant_id)
 
 
@@ -278,9 +323,11 @@ def get_tenant(tenant_id: str) -> dict[str, Any]:
 
 
 _TENANT_SELECT = """
-    SELECT t.id, t.weight, t.deficit, t.aging_settled_at,
+    SELECT t.id, t.weight, t.deficit, t.max_gpus, t.aging_settled_at,
            SUM(CASE WHEN j.status = 'QUEUED'   THEN 1 ELSE 0 END) AS queued,
-           SUM(CASE WHEN j.status = 'RUNNING'  THEN 1 ELSE 0 END) AS running
+           SUM(CASE WHEN j.status = 'RUNNING'  THEN 1 ELSE 0 END) AS running,
+           COALESCE(SUM(CASE WHEN j.status = 'RUNNING'
+                             THEN j.gpus ELSE 0 END), 0) AS running_gpus
       FROM tenants t
       LEFT JOIN jobs j ON j.tenant_id = t.id
      GROUP BY t.id
@@ -292,8 +339,12 @@ def _tenant_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         "id": row["id"],
         "weight": round(row["weight"], 6),
         "balance_gpu_min": round(row["deficit"], 6),
+        # Optional concurrent-GPU cap; None means unlimited.
+        "max_gpus": row["max_gpus"],
         "queued_jobs": row["queued"],
         "running_jobs": row["running"],
+        # GPUs currently held by the tenant's RUNNING jobs (cap usage).
+        "running_gpus": row["running_gpus"],
         "aging_settled_at": row["aging_settled_at"],
     }
 
@@ -355,9 +406,9 @@ def submit_job(
         ).fetchone() is None:
             conn.execute(
                 """INSERT INTO tenants
-                       (id, weight, deficit, aging_settled_at,
+                       (id, weight, deficit, max_gpus, aging_settled_at,
                         created_at, updated_at)
-                   VALUES (?, ?, 0, NULL, ?, ?)""",
+                   VALUES (?, ?, 0, NULL, NULL, ?, ?)""",
                 (tenant_id, float(weight), now, now),
             )
         else:
@@ -530,7 +581,7 @@ def run_batch(
 
         active = conn.execute(
             """SELECT DISTINCT j.tenant_id, t.weight, t.deficit,
-                              t.aging_settled_at
+                              t.max_gpus, t.aging_settled_at
                  FROM jobs j JOIN tenants t ON t.id = j.tenant_id
                 WHERE j.status = ?
                 ORDER BY j.tenant_id""",
@@ -568,6 +619,37 @@ def run_batch(
         ready_at_start = {
             tid for tid in active_ids if head_ready(head_of(tid))
         }
+
+        # Per-tenant concurrent-GPU caps (NULL = unlimited). Dispatch also
+        # respects each tenant's cap in addition to cluster capacity: the GPUs
+        # a tenant already has RUNNING plus the head job's request may not
+        # exceed its cap.
+        caps: dict[str, int | None] = {
+            t["tenant_id"]: t["max_gpus"] for t in active
+        }
+        tenant_running: dict[str, int] = {}
+
+        def running_gpus(tenant_id: str) -> int:
+            """GPUs currently held by the tenant's RUNNING jobs."""
+            row = conn.execute(
+                "SELECT COALESCE(SUM(gpus), 0) AS n FROM jobs "
+                "WHERE tenant_id = ? AND status = ?",
+                (tenant_id, RUNNING),
+            ).fetchone()
+            return int(row["n"])
+
+        for tid in active_ids:
+            tenant_running[tid] = running_gpus(tid)
+
+        def tenant_can_fit(tenant_id: str, head_gpus: int, free_gpus: int) -> bool:
+            """Head job must fit both the free cluster capacity and the
+            tenant's own concurrent-GPU cap."""
+            if head_gpus > free_gpus:
+                return False
+            cap = caps.get(tenant_id)
+            if cap is not None and tenant_running[tenant_id] + head_gpus > cap:
+                return False
+            return True
 
         # Aging is settled even when the cluster is full, so waiting tenants
         # keep accumulating starvation compensation across blocked batches.
@@ -623,11 +705,16 @@ def run_batch(
 
         # --- WDRR rounds ----------------------------------------------------
         # A tenant is visited in a round only while its head job FITS the
-        # currently free capacity. Fitting-but-unaffordable jobs keep
-        # accumulating quantum across rounds until affordable. A tenant whose
-        # head job cannot physically fit (capacity-blocked) accrues nothing:
-        # waiting for completions is compensated by aging, and this prevents
-        # callers farming quantum by repeatedly invoking the endpoint.
+        # currently free capacity AND the tenant's own concurrent-GPU cap.
+        # Fitting-but-unaffordable jobs keep accumulating quantum across rounds
+        # until affordable. A tenant whose head job cannot physically fit —
+        # blocked by cluster capacity OR by its tenant cap (running jobs
+        # already filling it, or the head alone exceeding it) — accrues no
+        # quantum this round: waiting for completions/cancellations is
+        # compensated by aging, and this prevents callers farming quantum by
+        # repeatedly invoking the endpoint. Other tenants are unaffected:
+        # each tenant's eligibility is evaluated independently, so a capped
+        # tenant is simply skipped while the rest still dispatch.
         #
         # Each round's grants are tentative above a commit watermark. The
         # moment a round produces a dispatch, every grant up to that point is
@@ -658,10 +745,14 @@ def run_batch(
             fitting = []
             for tid in active_ids:
                 h = head_of(tid)
-                if h is not None and head_ready(h) and h["gpus"] <= free:
+                if (
+                    h is not None
+                    and head_ready(h)
+                    and tenant_can_fit(tid, h["gpus"], free)
+                ):
                     fitting.append(tid)
             if not fitting:
-                break  # every queued job is capacity/dependency-blocked
+                break  # every queued job is capacity/cap/dependency-blocked
 
             rounds += 1
             dispatched_this_round = False
@@ -670,8 +761,11 @@ def run_batch(
                 if free <= 0:
                     break
                 head = head_of(tenant_id)
-                if head is None or head["gpus"] > free:
-                    # Became ineligible after earlier tenants in this round.
+                if head is None or not head_ready(head) or not tenant_can_fit(
+                    tenant_id, head["gpus"], free
+                ):
+                    # Became ineligible after earlier tenants in this round
+                    # (free GPUs consumed, or the tenant used its cap headroom).
                     continue
 
                 weight = conn.execute(
@@ -690,8 +784,9 @@ def run_batch(
 
                 if bal + _EPS < cost:
                     continue  # keep accruing in later rounds
-                if head["gpus"] > free:
-                    continue  # capacity invariant: never crossed
+                # Capacity and cap invariants: never crossed.
+                if not tenant_can_fit(tenant_id, head["gpus"], free):
+                    continue
 
                 run_index += 1
                 conn.execute(
@@ -708,6 +803,7 @@ def run_batch(
                 )
                 selected.append(head["id"])
                 free -= head["gpus"]
+                tenant_running[tenant_id] += head["gpus"]
                 dispatched_this_round = True
 
             if dispatched_this_round:
@@ -937,6 +1033,8 @@ def queue_overview() -> dict[str, Any]:
                 "tenant_id": t["id"],
                 "weight": round(t["weight"], 6),
                 "balance_gpu_min": round(t["deficit"], 6),
+                "max_gpus": t["max_gpus"],
+                "running_gpus": t["running_gpus"],
                 "oldest_queued_at": queued[0]["queued_at"],
                 "jobs": [
                     _job_dict(conn, j) | {"position": pos}

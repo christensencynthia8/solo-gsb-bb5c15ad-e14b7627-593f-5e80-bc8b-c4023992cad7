@@ -61,6 +61,9 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             id               TEXT PRIMARY KEY,
             weight           REAL NOT NULL,
             deficit          REAL NOT NULL DEFAULT 0,
+            -- Optional per-tenant cap on concurrently allocated GPUs;
+            -- NULL means unlimited (only cluster capacity constrains it).
+            max_gpus         INTEGER,
             -- Wall-clock time up to which aging has already been compensated.
             aging_settled_at TEXT,
             created_at       TEXT NOT NULL,
@@ -124,3 +127,12 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_ledger_tenant ON ledger(tenant_id, id);
         """
     )
+    # Backwards-compatible migration: databases created before per-tenant GPU
+    # caps existed have no ``tenants.max_gpus`` column. Add it nullable; every
+    # pre-existing tenant defaults to NULL (unlimited).
+    tenant_cols = {
+        r["name"]
+        for r in conn.execute("PRAGMA table_info(tenants)").fetchall()
+    }
+    if "max_gpus" not in tenant_cols:
+        conn.execute("ALTER TABLE tenants ADD COLUMN max_gpus INTEGER")

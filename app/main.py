@@ -47,6 +47,27 @@ async def scheduler_error_handler(request, exc: SchedulerError):
 class TenantIn(BaseModel):
     tenant_id: str = Field(..., min_length=1, examples=["team-a"])
     weight: float = Field(..., gt=0, examples=[2.0])
+    max_gpus: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional cap on GPUs the tenant may hold concurrently (RUNNING "
+            "jobs). Provide a positive integer to set/update the cap; send "
+            "null explicitly to clear it. Omit the field entirely to leave "
+            "an existing tenant's cap unchanged (new tenants get unlimited). "
+            "Note: the field must be omitted, not null, to preserve a cap."
+        ),
+        examples=[4],
+    )
+
+    @field_validator("max_gpus", mode="before")
+    @classmethod
+    def _reject_bool_for_int(cls, value):
+        # Run before Pydantic's bool->int coercion, since JSON booleans must
+        # not be accepted as an integer GPU cap.
+        if isinstance(value, bool):
+            raise ValueError("max_gpus must be a positive integer or null")
+        return value
 
 
 class JobIn(BaseModel):
@@ -81,6 +102,12 @@ class JobIn(BaseModel):
 
 @app.post("/tenants", tags=["tenants"], status_code=201)
 def create_or_update_tenant(body: TenantIn):
+    # Distinguish "field omitted" (preserve existing cap) from an explicit
+    # JSON null (clear the cap).
+    if "max_gpus" in body.model_fields_set:
+        return scheduler.upsert_tenant(
+            body.tenant_id, body.weight, max_gpus=body.max_gpus
+        )
     return scheduler.upsert_tenant(body.tenant_id, body.weight)
 
 

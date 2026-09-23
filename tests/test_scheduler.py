@@ -2,6 +2,7 @@
 import pytest
 
 from app import db, scheduler
+from app.config import get_settings
 from tests.conftest import at, iso  # noqa: F401
 
 
@@ -548,3 +549,227 @@ def test_gpu_usage_naive_datetimes_treated_as_utc(conn):
         datetime(2026, 1, 1, 0, 10), datetime(2026, 1, 1, 1, 0))
     aware, _ = usage_tenants(10, 60)
     assert naive["global"] == aware["global"]
+
+
+# ---------------------------------------------------------------------------
+# Per-tenant concurrent GPU caps
+# ---------------------------------------------------------------------------
+
+def test_tenant_cap_defaults_to_unlimited(conn):
+    # Old-style tenants (POST /jobs auto-register, POST /tenants without
+    # max_gpus) are unlimited.
+    submit("a", 8, 1, when=iso(0))
+    scheduler.upsert_tenant("b", 2.0)
+    tenants = {t["id"]: t for t in scheduler.list_tenants()}
+    assert tenants["a"]["max_gpus"] is None
+    assert tenants["b"]["max_gpus"] is None
+    assert tenants["a"]["running_gpus"] == 0
+    r = batch(1)
+    assert r["selection_order"] == ["J000001"]  # whole cluster allowed
+
+
+def test_cap_blocks_when_running_jobs_fill_it_and_releases_afterwards(conn):
+    # Tenant 'a' is capped at 2 GPUs.
+    t = scheduler.upsert_tenant("a", 1.0, max_gpus=2)
+    assert t["max_gpus"] == 2 and t["running_gpus"] == 0
+    submit("a", 2, 1, when=iso(0))   # J1: exactly fills the cap
+    submit("a", 1, 1, when=iso(1))   # J2: would exceed it (2+1 > 2)
+
+    r1 = batch(2)
+    assert r1["selection_order"] == ["J000001"]
+    a = scheduler.get_tenant("a")
+    assert a["running_gpus"] == 2 and a["running_jobs"] == 1
+
+    # Capped head: stays QUEUED, earns no quantum for this round.
+    before = balances()["a"]
+    r2 = batch(2)
+    assert r2["selection_order"] == []
+    assert all(e["kind"] != "QUANTUM" for e in r2["events"])
+    assert balances()["a"] == before
+    queued = [j for j in scheduler.list_jobs(status="QUEUED")]
+    assert [j["id"] for j in queued] == ["J000002"]
+
+    # Completing the running job releases the cap headroom: J2 dispatches.
+    scheduler.complete_job("J000001")
+    assert scheduler.get_tenant("a")["running_gpus"] == 0
+    r3 = batch(3)
+    assert r3["selection_order"] == ["J000002"]
+    assert scheduler.get_tenant("a")["running_gpus"] == 1
+
+    # Cancelling also releases cap headroom.
+    scheduler.cancel_job("J000002")
+    assert scheduler.get_tenant("a")["running_gpus"] == 0
+
+
+def test_head_alone_exceeding_cap_is_not_dispatched_and_earns_no_quantum(conn):
+    scheduler.upsert_tenant("a", 1.0, max_gpus=2)
+    submit("a", 3, 1, when=iso(0))   # 3 > cap 2 (cluster has 8 free)
+    r = batch(5)
+    assert r["selection_order"] == []
+    assert all(e["kind"] != "QUANTUM" for e in r["events"])
+    assert scheduler.scheduler_state()["used_gpus"] == 0
+    # It stays queued (no rejection); a later cap raise releases it.
+    scheduler.upsert_tenant("a", 1.0, max_gpus=3)
+    r2 = batch(6)
+    assert r2["selection_order"] == ["J000001"]
+
+
+def test_cap_does_not_block_other_tenants(conn):
+    # 'a' caps itself at 2 GPUs; 'b' is unlimited.
+    scheduler.upsert_tenant("a", 1.0, max_gpus=2)
+    submit("a", 2, 1, when=iso(0))
+    submit("a", 2, 1, when=iso(1))   # blocked by a's cap after J1
+    submit("b", 4, 1, when=iso(2))   # must still run (2 + 4 <= 8)
+
+    r = batch(3)
+    assert r["selection_order"] == ["J000001", "J000003"]
+    assert scheduler.get_tenant("a")["running_gpus"] == 2
+    assert scheduler.get_tenant("b")["running_gpus"] == 4
+    # a received exactly one quantum (J1's dispatch), none for the blocked
+    # J2; b dispatched normally.
+    a_quanta = [e for e in r["events"]
+                if e["tenant_id"] == "a" and e["kind"] == "QUANTUM"]
+    assert len(a_quanta) == 1
+    assert any(e["tenant_id"] == "b" and e["kind"] == "DISPATCH"
+               for e in r["events"])
+
+
+def test_cap_respected_together_with_cluster_capacity(conn):
+    # a cap 6: even once quantum accrues, a 6-GPU head can run, but a second
+    # job waits while cluster free = 2 and a's remaining cap = 0.
+    scheduler.upsert_tenant("a", 1.0, max_gpus=6)
+    submit("a", 6, 1, when=iso(0))
+    submit("a", 2, 1, when=iso(1))
+    submit("b", 2, 1, when=iso(2))
+
+    r = batch(3)
+    # Visit order: a dispatches J1 (6), a's head no longer fits (cap full),
+    # b then dispatches J3 (2) -> cluster full.
+    assert r["selection_order"] == ["J000001", "J000003"]
+    assert scheduler.scheduler_state()["free_gpus"] == 0
+    # Free b's 2 GPUs: a's cap is still full (6), so J2 must still wait.
+    scheduler.complete_job("J000003")
+    assert scheduler.scheduler_state()["free_gpus"] == 2
+    r2 = batch(4)
+    assert r2["selection_order"] == []
+    assert all(e["kind"] != "QUANTUM" for e in r2["events"])
+    # Release a's running job: J2 fits both cap (6 >= 2) and cluster (2 free).
+    scheduler.complete_job("J000001")
+    r3 = batch(5)
+    assert r3["selection_order"] == ["J000002"]
+
+
+def test_cap_update_clear_and_omit_preserves(conn):
+    t = scheduler.upsert_tenant("a", 1.0, max_gpus=2)
+    assert t["max_gpus"] == 2
+
+    # Omit max_gpus (UNSET): weight update preserves the cap.
+    t2 = scheduler.upsert_tenant("a", 3.0)
+    assert t2["max_gpus"] == 2 and t2["weight"] == 3.0
+
+    # Explicit None clears the cap.
+    t3 = scheduler.upsert_tenant("a", 3.0, max_gpus=None)
+    assert t3["max_gpus"] is None
+
+    # A brand-new tenant created without the argument is unlimited.
+    assert scheduler.upsert_tenant("fresh", 1.0)["max_gpus"] is None
+    # ...and one created with None is unlimited too.
+    assert scheduler.upsert_tenant("fresh2", 1.0, max_gpus=None)["max_gpus"] is None
+
+
+def test_invalid_max_gpus_rejected(conn):
+    with pytest.raises(scheduler.SchedulerError):
+        scheduler.upsert_tenant("a", 1.0, max_gpus=0)
+    with pytest.raises(scheduler.SchedulerError):
+        scheduler.upsert_tenant("a", 1.0, max_gpus=-3)
+    with pytest.raises(scheduler.SchedulerError):
+        scheduler.upsert_tenant("a", 1.0, max_gpus=2.5)
+    with pytest.raises(scheduler.SchedulerError):
+        scheduler.upsert_tenant("a", 1.0, max_gpus=True)
+
+
+def test_cap_persisted_in_queue_and_batch_snapshots(conn):
+    scheduler.upsert_tenant("a", 1.0, max_gpus=2)
+    submit("a", 2, 1, when=iso(0))
+    batch(1)
+    submit("a", 1, 1, when=iso(2))
+    q = scheduler.queue_overview()
+    group = q["queues"][0]
+    assert group["max_gpus"] == 2
+    assert group["running_gpus"] == 2
+    state = scheduler.scheduler_state()
+    a = next(t for t in state["tenants"] if t["id"] == "a")
+    assert a["max_gpus"] == 2 and a["running_gpus"] == 2
+
+
+def test_max_gpus_column_migrated_from_legacy_database(tmp_path, monkeypatch):
+    """A DB created by the pre-cap schema gets max_gpus added, defaulting
+    to unlimited for existing tenants, and the service keeps working."""
+    import sqlite3
+
+    from app import db as db_mod
+
+    legacy = tmp_path / "legacy.db"
+    c = sqlite3.connect(str(legacy))
+    c.executescript(
+        """
+        CREATE TABLE tenants (
+            id TEXT PRIMARY KEY, weight REAL NOT NULL, deficit REAL NOT NULL
+                DEFAULT 0,
+            aging_settled_at TEXT, created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL,
+            now_ref TEXT NOT NULL, capacity_gpus INTEGER NOT NULL,
+            used_gpus_before INTEGER NOT NULL, available_gpus INTEGER NOT NULL,
+            rounds INTEGER NOT NULL, jobs_selected INTEGER NOT NULL
+        );
+        CREATE TABLE jobs (
+            id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id),
+            gpus INTEGER NOT NULL, duration_min INTEGER NOT NULL,
+            cost_gpu_min REAL NOT NULL, status TEXT NOT NULL,
+            queued_at TEXT NOT NULL, scheduled_at TEXT, completed_at TEXT,
+            batch_id INTEGER REFERENCES batches(id), run_index INTEGER
+        );
+        CREATE TABLE job_dependencies (
+            job_id TEXT NOT NULL REFERENCES jobs(id),
+            depends_on TEXT NOT NULL REFERENCES jobs(id),
+            PRIMARY KEY (job_id, depends_on)
+        );
+        CREATE TABLE ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL REFERENCES tenants(id),
+            batch_id INTEGER REFERENCES batches(id), job_id TEXT REFERENCES jobs(id),
+            kind TEXT NOT NULL, amount REAL NOT NULL, balance_after REAL NOT NULL,
+            detail TEXT, created_at TEXT NOT NULL
+        );
+        INSERT INTO tenants (id, weight, deficit, created_at, updated_at)
+        VALUES ('old', 1.0, 0, '2026-01-01T00:00:00+00:00',
+                '2026-01-01T00:00:00+00:00');
+        INSERT INTO jobs (id, tenant_id, gpus, duration_min, cost_gpu_min,
+                          status, queued_at)
+        VALUES ('J000001', 'old', 8, 1, 8, 'QUEUED',
+                '2026-01-01T00:00:00+00:00');
+        """
+    )
+    c.commit()
+    c.close()
+
+    monkeypatch.setenv("DB_PATH", str(legacy))
+    monkeypatch.setenv("CLUSTER_GPUS", "8")
+    get_settings.cache_clear()
+    db_mod.reset_for_tests()
+    try:
+        db_mod.connect(str(legacy))
+        # Existing tenant migrated with an unlimited cap and still works.
+        old = scheduler.get_tenant("old")
+        assert old["max_gpus"] is None
+        r = scheduler.run_batch(now=at(5))
+        assert r["selection_order"] == ["J000001"]
+        # New tenants can set caps on the migrated schema.
+        t = scheduler.upsert_tenant("new", 1.0, max_gpus=2)
+        assert t["max_gpus"] == 2
+    finally:
+        db_mod.reset_for_tests()
+        get_settings.cache_clear()

@@ -11,3 +11,6 @@ data/
 *.md
 tests/
 scripts/
+
+# Locally installed Python deps (dev environment bootstrap)
+.pydeps/
