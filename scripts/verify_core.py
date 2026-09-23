@@ -204,6 +204,41 @@ def main() -> int:
         {"id": p3["id"], "status": "CANCELLED"}]
     print("case 7 dependencies + blocked_by OK")
 
+    # --- Case 8: per-tenant concurrent GPU cap -----------------------------
+    db.reset_for_tests()
+    db.connect(":memory:")
+    scheduler.upsert_tenant("a", 1.0, gpu_cap=2)
+    assert scheduler.get_tenant("a")["gpu_cap"] == 2
+    submit("a", 2, 10, 1.0, iso(0))                       # fills the cap
+    submit("a", 1, 10, 1.0, iso(0))                       # blocked (3 > 2)
+    submit("b", 2, 10, 1.0, iso(0))                       # unlimited, runs
+    r = scheduler.run_batch(now=at(10))
+    assert r["selection_order"] == ["J000001", "J000003"], r["selection_order"]
+    a_quanta = [e for e in r["events"]
+                if e["tenant_id"] == "a" and e["kind"] == "QUANTUM"]
+    assert len(a_quanta) == 1 and a_quanta[0]["detail"] == "round 1"
+    # Cap-blocked head: no dispatch and no quantum; aging still settles.
+    r2 = scheduler.run_batch(now=at(20))
+    assert r2["selection_order"] == []
+    assert all(
+        not (e["tenant_id"] == "a" and e["kind"] == "QUANTUM")
+        for e in r2["events"])
+    assert any(
+        e["tenant_id"] == "a" and e["kind"] == "AGING" for e in r2["events"])
+    # Completion releases the cap quota; clearing the cap works as well.
+    scheduler.complete_job("J000001")
+    r3 = scheduler.run_batch(now=at(30))
+    assert r3["selection_order"] == ["J000002"], r3["selection_order"]
+    scheduler.upsert_tenant("a", 1.0, gpu_cap=None)
+    assert scheduler.get_tenant("a")["gpu_cap"] is None
+    # A job bigger than the cap alone never dispatches; raising it releases.
+    scheduler.upsert_tenant("c", 1.0, gpu_cap=1)
+    submit("c", 2, 10, 1.0, iso(31))
+    assert scheduler.run_batch(now=at(40))["selection_order"] == []
+    scheduler.upsert_tenant("c", 1.0, gpu_cap=2)
+    assert scheduler.run_batch(now=at(50))["selection_order"] == ["J000004"]
+    print("case 8 per-tenant GPU cap OK")
+
     print("\nALL CORE CHECKS PASSED")
     return 0
 

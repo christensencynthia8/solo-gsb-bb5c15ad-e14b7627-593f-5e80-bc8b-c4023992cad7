@@ -377,6 +377,117 @@ def test_queue_overview_annotates_blocked_by(conn):
 
 
 # ---------------------------------------------------------------------------
+# Per-tenant concurrent GPU cap
+# ---------------------------------------------------------------------------
+
+def test_tenant_gpu_cap_defaults_null_and_is_persisted(conn):
+    scheduler.upsert_tenant("a", 1.0)
+    assert scheduler.get_tenant("a")["gpu_cap"] is None
+    # Job auto-registration also yields an unlimited tenant.
+    submit("auto", 1, 5, when=iso(0))
+    assert scheduler.get_tenant("auto")["gpu_cap"] is None
+
+    scheduler.upsert_tenant("a", 1.0, gpu_cap=4)
+    assert scheduler.get_tenant("a")["gpu_cap"] == 4
+    # Omitting the cap keeps it while updating weight; null clears it.
+    scheduler.upsert_tenant("a", 2.0)
+    t = scheduler.get_tenant("a")
+    assert t["gpu_cap"] == 4 and t["weight"] == pytest.approx(2.0)
+    scheduler.upsert_tenant("a", 2.0, gpu_cap=None)
+    assert scheduler.get_tenant("a")["gpu_cap"] is None
+
+    for bad in (0, -3, 2.5, True):
+        with pytest.raises(scheduler.SchedulerError):
+            scheduler.upsert_tenant("b", 1.0, gpu_cap=bad)
+
+
+def test_gpu_cap_blocks_running_saturated_tenant_without_quantum(conn):
+    scheduler.upsert_tenant("a", 1.0, gpu_cap=2)
+    submit("a", 2, 10, when=iso(0))
+    r = batch(10)
+    assert r["selection_order"] == ["J000001"]
+
+    # Head would take the tenant to 3 > 2: it stays queued and earns no
+    # quantum for the blocked head.
+    submit("a", 1, 10, when=iso(11))
+    r2 = batch(20)
+    assert r2["selection_order"] == []
+    assert all(
+        e["kind"] != "QUANTUM"
+        for e in r2["events"] if e["tenant_id"] == "a"
+    )
+    # Aging still settles: the tenant is waiting for RUNNING jobs to release.
+    assert any(
+        e["kind"] == "AGING" and e["tenant_id"] == "a" for e in r2["events"]
+    )
+    # Same-instant retry cannot farm credit.
+    before = balances()["a"]
+    r3 = batch(20)
+    assert r3["selection_order"] == []
+    assert balances()["a"] == pytest.approx(before)
+
+
+def test_gpu_cap_head_alone_over_cap_never_dispatches(conn):
+    scheduler.upsert_tenant("a", 1.0, gpu_cap=2)
+    submit("a", 4, 10, when=iso(0))  # exceeds cap even with 0 RUNNING GPUs
+    submit("b", 2, 10, when=iso(0))
+    r = batch(10)
+    assert r["selection_order"] == ["J000002"]
+    assert all(
+        e["kind"] != "QUANTUM"
+        for e in r["events"] if e["tenant_id"] == "a"
+    )
+    # Even with the whole cluster free, the over-cap head cannot run.
+    scheduler.complete_job("J000002")
+    assert batch(20)["selection_order"] == []
+    # Raising the cap releases it.
+    scheduler.upsert_tenant("a", 1.0, gpu_cap=4)
+    assert batch(30)["selection_order"] == ["J000001"]
+
+
+def test_gpu_cap_skips_blocked_tenant_but_others_still_schedule(conn):
+    scheduler.upsert_tenant("a", 1.0, gpu_cap=1)
+    submit("a", 1, 10, when=iso(0))
+    submit("a", 1, 10, when=iso(0))   # blocked once J1 RUNNING (1+1 > 1)
+    submit("b", 4, 10, when=iso(0))   # unlimited, fits
+    submit("c", 2, 10, when=iso(0))   # unlimited, fits
+    r = batch(10)
+    # a's blocked head never steals quantum it cannot spend; b and c run.
+    assert r["selection_order"] == ["J000001", "J000003", "J000004"]
+    assert r["used_gpus_after"] == 7
+    tenants = {t["id"]: t for t in r["tenants"]}
+    assert tenants["a"]["running_gpus"] == 1
+    assert tenants["b"]["running_gpus"] == 4
+    assert tenants["c"]["running_gpus"] == 2
+    a_quanta = [e for e in r["events"]
+                if e["tenant_id"] == "a" and e["kind"] == "QUANTUM"]
+    assert len(a_quanta) == 1 and a_quanta[0]["detail"] == "round 1"
+
+
+def test_gpu_cap_counts_gpus_not_jobs_and_releases_on_finish(conn):
+    scheduler.upsert_tenant("a", 1.0, gpu_cap=3)
+    # One 3-GPU RUNNING job saturates the cap; a 1-GPU head stays queued.
+    submit("a", 3, 10, when=iso(0))
+    submit("a", 1, 10, when=iso(0))
+    assert batch(10)["selection_order"] == ["J000001"]
+    assert batch(11)["selection_order"] == []
+
+    scheduler.complete_job("J000001")
+    assert batch(20)["selection_order"] == ["J000002"]
+
+    # Cancelling a RUNNING job releases the cap as well.
+    submit("a", 3, 10, when=iso(21))
+    assert batch(30)["selection_order"] == []  # J2 occupies 1/3
+    scheduler.cancel_job("J000002")
+    assert batch(40)["selection_order"] == ["J000003"]
+    # Queued-only cancellation changes nothing about the cap (no GPUs held).
+    submit("a", 1, 10, when=iso(41))
+    j4 = scheduler.list_jobs(status="QUEUED", tenant_id="a")[0]["id"]
+    scheduler.cancel_job(j4)
+    assert scheduler.get_tenant("a")["running_gpus"] == 3
+
+
+# ---------------------------------------------------------------------------
 # GPU usage window aggregation
 # ---------------------------------------------------------------------------
 

@@ -272,6 +272,69 @@ def test_gpu_usage_invalid_window_via_http(client):
         }).status_code == 422
 
 
+def test_tenant_gpu_cap_set_clear_and_enforce_via_http(client):
+    # New tenant defaults to unlimited.
+    r = client.post("/tenants", json={"tenant_id": "team-a", "weight": 1})
+    assert r.status_code == 201, r.text
+    assert r.json()["gpu_cap"] is None
+    assert r.json()["running_gpus"] == 0
+
+    # Set a cap.
+    r = client.post("/tenants", json={
+        "tenant_id": "team-a", "weight": 1, "gpu_cap": 2})
+    assert r.status_code == 201
+    assert r.json()["gpu_cap"] == 2
+
+    j1 = client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 2, "duration_min": 10}).json()["id"]
+    j2 = client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 1, "duration_min": 10}).json()["id"]
+    # Another tenant still schedules while team-a is cap-blocked.
+    j3 = client.post("/jobs", json={
+        "tenant_id": "team-b", "gpus": 3, "duration_min": 10}).json()["id"]
+
+    body = client.post("/scheduler/batch").json()
+    assert body["selection_order"] == [j1, j3]
+    a_events = [e for e in body["events"]
+                if e["tenant_id"] == "team-a" and e["kind"] == "QUANTUM"]
+    assert len(a_events) == 1  # only the round-1 grant that dispatched j1
+
+    # Cap-blocked second batch: j2 stays queued, no quantum farming.
+    body = client.post("/scheduler/batch").json()
+    assert body["selection_order"] == []
+    assert all(
+        e["kind"] != "QUANTUM"
+        for e in body["events"] if e["tenant_id"] == "team-a"
+    )
+
+    # Queue/tenant views report the cap and current usage.
+    group = next(g for g in client.get("/queue").json()["queues"]
+                 if g["tenant_id"] == "team-a")
+    assert group["gpu_cap"] == 2 and group["running_gpus"] == 2
+    a = next(t for t in client.get("/tenants").json()
+             if t["id"] == "team-a")
+    assert a["gpu_cap"] == 2 and a["running_gpus"] == 2
+
+    # Completing j1 releases quota; j2 dispatches.
+    assert client.post(f"/jobs/{j1}/complete").status_code == 200
+    assert client.post("/scheduler/batch").json()["selection_order"] == [j2]
+
+    # Update weight without sending gpu_cap: cap is retained.
+    r = client.post("/tenants", json={"tenant_id": "team-a", "weight": 2})
+    assert r.json()["gpu_cap"] == 2 and r.json()["weight"] == 2.0
+
+    # Explicit null clears the cap.
+    r = client.post("/tenants", json={
+        "tenant_id": "team-a", "weight": 2, "gpu_cap": None})
+    assert r.json()["gpu_cap"] is None
+
+    # Invalid caps are 422 (pydantic).
+    for bad in (0, -1):
+        r = client.post("/tenants", json={
+            "tenant_id": "team-a", "weight": 1, "gpu_cap": bad})
+        assert r.status_code == 422
+
+
 def test_gpu_usage_empty_database_zeros(client):
     r = client.get("/usage/gpu", params={
         "start": "2026-01-01T00:00:00Z",

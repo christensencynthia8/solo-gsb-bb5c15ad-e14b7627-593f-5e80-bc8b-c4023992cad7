@@ -47,6 +47,17 @@ async def scheduler_error_handler(request, exc: SchedulerError):
 class TenantIn(BaseModel):
     tenant_id: str = Field(..., min_length=1, examples=["team-a"])
     weight: float = Field(..., gt=0, examples=[2.0])
+    gpu_cap: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Optional cap on GPUs concurrently occupied by the tenant's "
+            "RUNNING jobs. A positive integer sets the cap; null explicitly "
+            "clears it (unlimited). Omitting the field keeps the existing "
+            "cap; newly created tenants default to unlimited."
+        ),
+        examples=[4],
+    )
 
 
 class JobIn(BaseModel):
@@ -81,7 +92,15 @@ class JobIn(BaseModel):
 
 @app.post("/tenants", tags=["tenants"], status_code=201)
 def create_or_update_tenant(body: TenantIn):
-    return scheduler.upsert_tenant(body.tenant_id, body.weight)
+    # Only an explicitly present gpu_cap (including null = clear) changes the
+    # cap; an omitted field preserves the stored value for legacy callers.
+    gpu_cap = (
+        body.gpu_cap if "gpu_cap" in body.model_fields_set
+        else scheduler._UNCHANGED
+    )
+    return scheduler.upsert_tenant(
+        body.tenant_id, body.weight, gpu_cap=gpu_cap
+    )
 
 
 @app.get("/tenants", tags=["tenants"])

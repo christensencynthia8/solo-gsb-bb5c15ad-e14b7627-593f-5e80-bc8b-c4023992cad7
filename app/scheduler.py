@@ -18,9 +18,21 @@ WDRR per batch
 1. Each active tenant (one with QUEUED jobs, tenant id order) receives
    ``base_quantum * weight`` GPU-minutes of credit every DRR round.
 2. Visiting tenants in fixed order, the head-of-line job is dispatched when
-   ``balance >= job_cost`` AND enough free GPUs exist.
+   ``balance >= job_cost`` AND enough free GPUs exist AND the tenant's
+   optional concurrent-GPU cap is not exceeded.
 3. A full round in which nothing is dispatched ends the batch: blocked jobs
    keep their credit, and a later batch (after completions or aging) retries.
+
+Per-tenant GPU cap
+==================
+A tenant may optionally cap the GPUs concurrently occupied by its RUNNING
+jobs (``POST /tenants`` with ``gpu_cap``; ``null`` clears it, old tenants are
+unlimited). In a batch the head job fits only when
+``running_gpus(tenant) + head.gpus <= gpu_cap``. A tenant whose RUNNING jobs
+already saturate its cap, or whose head job alone would cross it, is never
+dispatched and receives no QUANTUM in that round/batch; other eligible
+tenants still schedule. Completion and RUNNING-job cancellation release the
+occupied GPUs; the cap is persisted in the ``tenants`` table.
 
 Aging compensation
 ==================
@@ -64,6 +76,10 @@ QUEUED, RUNNING, COMPLETED, CANCELLED = "QUEUED", "RUNNING", "COMPLETED", "CANCE
 
 # Float comparison tolerance for the affordability test.
 _EPS = 1e-9
+
+# Sentinel for optional fields that must keep their stored value (distinct from
+# None, which explicitly clears a nullable field such as the GPU cap).
+_UNCHANGED = object()
 
 
 class SchedulerError(Exception):
@@ -235,13 +251,24 @@ def _find_cycle(
 def upsert_tenant(
     tenant_id: str,
     weight: float,
+    gpu_cap: int | None | object = _UNCHANGED,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
-    """Create a tenant or update its weight. Existing balances are retained."""
+    """Create a tenant or update its weight. Existing balances are retained.
+
+    ``gpu_cap`` sets (positive int) or clears (``None``) the optional cap on
+    GPUs concurrently occupied by the tenant's RUNNING jobs. Omitted (the
+    ``_UNCHANGED`` sentinel) it leaves the existing cap untouched; a newly
+    created tenant defaults to unlimited.
+    """
     if not tenant_id or not tenant_id.strip():
         raise SchedulerError("tenant_id must be a non-empty string")
     if weight <= 0:
         raise SchedulerError("weight must be > 0")
+    if gpu_cap is not _UNCHANGED and gpu_cap is not None:
+        if not isinstance(gpu_cap, int) or isinstance(gpu_cap, bool) \
+                or gpu_cap <= 0:
+            raise SchedulerError("gpu_cap must be a positive integer or null")
     settings = settings or get_settings()
     now = _now_iso()
     with db.get_lock(), db.get_conn():
@@ -251,18 +278,27 @@ def upsert_tenant(
             "SELECT id FROM tenants WHERE id = ?", (tenant_id,)
         ).fetchone()
         if existing is None:
+            # Legacy behaviour on creation without an explicit cap: unlimited.
+            cap = None if gpu_cap is _UNCHANGED else gpu_cap
             conn.execute(
                 """INSERT INTO tenants
-                       (id, weight, deficit, aging_settled_at,
+                       (id, weight, deficit, gpu_cap, aging_settled_at,
                         created_at, updated_at)
-                   VALUES (?, ?, 0, NULL, ?, ?)""",
-                (tenant_id, float(weight), now, now),
+                   VALUES (?, ?, 0, ?, NULL, ?, ?)""",
+                (tenant_id, float(weight), cap, now, now),
             )
         else:
-            conn.execute(
-                "UPDATE tenants SET weight = ?, updated_at = ? WHERE id = ?",
-                (float(weight), now, tenant_id),
-            )
+            if gpu_cap is _UNCHANGED:
+                conn.execute(
+                    "UPDATE tenants SET weight = ?, updated_at = ? WHERE id = ?",
+                    (float(weight), now, tenant_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE tenants SET weight = ?, gpu_cap = ?, "
+                    "updated_at = ? WHERE id = ?",
+                    (float(weight), gpu_cap, now, tenant_id),
+                )
         return get_tenant(tenant_id)
 
 
@@ -278,9 +314,11 @@ def get_tenant(tenant_id: str) -> dict[str, Any]:
 
 
 _TENANT_SELECT = """
-    SELECT t.id, t.weight, t.deficit, t.aging_settled_at,
+    SELECT t.id, t.weight, t.deficit, t.gpu_cap, t.aging_settled_at,
            SUM(CASE WHEN j.status = 'QUEUED'   THEN 1 ELSE 0 END) AS queued,
-           SUM(CASE WHEN j.status = 'RUNNING'  THEN 1 ELSE 0 END) AS running
+           SUM(CASE WHEN j.status = 'RUNNING'  THEN 1 ELSE 0 END) AS running,
+           COALESCE(SUM(CASE WHEN j.status = 'RUNNING'
+                             THEN j.gpus ELSE 0 END), 0) AS running_gpus
       FROM tenants t
       LEFT JOIN jobs j ON j.tenant_id = t.id
      GROUP BY t.id
@@ -292,8 +330,11 @@ def _tenant_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         "id": row["id"],
         "weight": round(row["weight"], 6),
         "balance_gpu_min": round(row["deficit"], 6),
+        # Optional per-tenant cap on concurrently occupied GPUs; null = none.
+        "gpu_cap": row["gpu_cap"],
         "queued_jobs": row["queued"],
         "running_jobs": row["running"],
+        "running_gpus": row["running_gpus"],
         "aging_settled_at": row["aging_settled_at"],
     }
 
@@ -530,7 +571,7 @@ def run_batch(
 
         active = conn.execute(
             """SELECT DISTINCT j.tenant_id, t.weight, t.deficit,
-                              t.aging_settled_at
+                              t.gpu_cap, t.aging_settled_at
                  FROM jobs j JOIN tenants t ON t.id = j.tenant_id
                 WHERE j.status = ?
                 ORDER BY j.tenant_id""",
@@ -622,12 +663,15 @@ def run_batch(
             return _batch_result(conn, batch_id, settings)
 
         # --- WDRR rounds ----------------------------------------------------
-        # A tenant is visited in a round only while its head job FITS the
-        # currently free capacity. Fitting-but-unaffordable jobs keep
-        # accumulating quantum across rounds until affordable. A tenant whose
-        # head job cannot physically fit (capacity-blocked) accrues nothing:
-        # waiting for completions is compensated by aging, and this prevents
-        # callers farming quantum by repeatedly invoking the endpoint.
+        # A tenant is visited in a round only while its head job FITS both
+        # resource limits: the currently free cluster capacity AND the
+        # tenant's own concurrent-GPU cap (RUNNING GPUs of the tenant plus the
+        # head's request must not exceed gpu_cap). Fitting-but-unaffordable
+        # jobs keep accumulating quantum across rounds until affordable. A
+        # tenant whose head job does not fit (capacity- or cap-blocked)
+        # accrues nothing: waiting for completions is compensated by aging,
+        # and this prevents callers farming quantum by repeatedly invoking the
+        # endpoint.
         #
         # Each round's grants are tentative above a commit watermark. The
         # moment a round produces a dispatch, every grant up to that point is
@@ -638,6 +682,23 @@ def run_batch(
         run_index = 0
         rounds = 0
         free = available
+
+        # Per-tenant GPU caps (None = unlimited) and the GPUs each tenant
+        # currently occupies with RUNNING jobs. Updated inline on dispatch so
+        # the cap is respected for a tenant's later head jobs in this batch.
+        caps = {t["tenant_id"]: t["gpu_cap"] for t in active}
+
+        def tenant_cap_allows(tid: str, need: int, used: dict[str, int]) -> bool:
+            cap = caps[tid]
+            return cap is None or used.get(tid, 0) + need <= cap
+
+        used_rows = conn.execute(
+            "SELECT tenant_id, SUM(gpus) AS n FROM jobs "
+            "WHERE status = ? GROUP BY tenant_id",
+            (RUNNING,),
+        ).fetchall()
+        tenant_used: dict[str, int] = {r["tenant_id"]: r["n"] for r in used_rows}
+
         commit_mark = conn.execute(
             "SELECT COALESCE(MAX(id), 0) AS m FROM ledger"
         ).fetchone()["m"]
@@ -658,10 +719,15 @@ def run_batch(
             fitting = []
             for tid in active_ids:
                 h = head_of(tid)
-                if h is not None and head_ready(h) and h["gpus"] <= free:
+                if (
+                    h is not None
+                    and head_ready(h)
+                    and h["gpus"] <= free
+                    and tenant_cap_allows(tid, h["gpus"], tenant_used)
+                ):
                     fitting.append(tid)
             if not fitting:
-                break  # every queued job is capacity/dependency-blocked
+                break  # every queued job is blocked (capacity/cap/dependency)
 
             rounds += 1
             dispatched_this_round = False
@@ -672,6 +738,9 @@ def run_batch(
                 head = head_of(tenant_id)
                 if head is None or head["gpus"] > free:
                     # Became ineligible after earlier tenants in this round.
+                    continue
+                if not tenant_cap_allows(tenant_id, head["gpus"], tenant_used):
+                    # Tenant cap saturated: skip without any quantum grant.
                     continue
 
                 weight = conn.execute(
@@ -708,6 +777,9 @@ def run_batch(
                 )
                 selected.append(head["id"])
                 free -= head["gpus"]
+                tenant_used[tenant_id] = (
+                    tenant_used.get(tenant_id, 0) + head["gpus"]
+                )
                 dispatched_this_round = True
 
             if dispatched_this_round:
@@ -937,6 +1009,8 @@ def queue_overview() -> dict[str, Any]:
                 "tenant_id": t["id"],
                 "weight": round(t["weight"], 6),
                 "balance_gpu_min": round(t["deficit"], 6),
+                "gpu_cap": t["gpu_cap"],
+                "running_gpus": t["running_gpus"],
                 "oldest_queued_at": queued[0]["queued_at"],
                 "jobs": [
                     _job_dict(conn, j) | {"position": pos}

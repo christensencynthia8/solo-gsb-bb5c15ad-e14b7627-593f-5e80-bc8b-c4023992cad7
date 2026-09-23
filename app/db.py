@@ -61,6 +61,9 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             id               TEXT PRIMARY KEY,
             weight           REAL NOT NULL,
             deficit          REAL NOT NULL DEFAULT 0,
+            -- Optional cap on GPUs concurrently occupied by the tenant's
+            -- RUNNING jobs. NULL means unlimited (legacy default).
+            gpu_cap          INTEGER,
             -- Wall-clock time up to which aging has already been compensated.
             aging_settled_at TEXT,
             created_at       TEXT NOT NULL,
@@ -124,3 +127,19 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_ledger_tenant ON ledger(tenant_id, id);
         """
     )
+    _migrate_schema(conn)
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Bring databases created by older releases up to the current schema.
+
+    ``CREATE TABLE IF NOT EXISTS`` never adds columns to an already existing
+    table, so new columns are appended here with additive ALTER TABLEs guarded
+    by ``PRAGMA table_info``: legacy tenants default to NULL (unlimited).
+    """
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(tenants)")}
+    if "gpu_cap" not in columns:
+        conn.execute(
+            "ALTER TABLE tenants ADD COLUMN gpu_cap INTEGER"
+        )
+

@@ -59,9 +59,10 @@ cost_gpu_min = gpus × duration_min        # GPU-分钟
 2. 每个 DRR 轮次，每位“队首作业能放入当前空闲 GPU”的租户获得
    `BASE_QUANTUM_GPU_MIN × weight` 的 QUANTUM 信用。
 3. 按固定顺序访问租户：当 `余额 ≥ 队首作业成本` **且** `空闲 GPU ≥ 作业 GPU 数`
+   **且** `该租户 RUNNING GPU + 作业 GPU ≤ 租户 gpu_cap（若设置）`
    时，派发该作业并扣减余额；否则继续。
-4. **容量永远不越界**：放不下的作业（仅因容量阻塞）本轮及本批次不获得任何
-   QUANTUM——等待释放由老化补偿，也避免重复调用接口“刷”余额。
+4. **容量与租户上限都不会越界**：因任一约束放不下的作业本轮及本批次不获得任何
+   QUANTUM——等待释放由老化补偿，也避免重复调用接口“刷”余额；其他租户不受影响。
 5. “放得下但暂时买不起”的租户可在**同一批次内连续多轮累积**直到买得起；
    批次结束时未促成任何派发的尾部授权自动回滚，保证空转调用不改变余额。
 
@@ -84,6 +85,43 @@ QUEUED ──(batch 选中)──▶ RUNNING ──complete──▶ COMPLETED
 ```
 
 RUNNING 作业占用 GPU，直到 `complete`/`cancel` 才释放给后续批次。
+
+### 租户并发 GPU 上限（可选 `gpu_cap`）
+
+可为每个租户设置其 **RUNNING 作业可并发占用的 GPU 上限**（按 GPU 数计，与作业个数无关）；
+旧租户与未设置的租户**默认不限额（`null`）**。
+
+- 通过 `POST /tenants` 设置（正整数）或清除（`null`），上限持久化在 `tenants` 表中；
+  更新权重时**省略 `gpu_cap` 字段会保留原值**（向后兼容）。
+- `POST /scheduler/batch` 选作业时**同时**检查两道约束：
+  1. 集群容量：`空闲 GPU ≥ 作业 GPU 数`；
+  2. 租户上限：`该租户当前 RUNNING GPU 数 + 作业 GPU 数 ≤ gpu_cap`。
+- 租户已有 RUNNING 作业**占满上限**、或**队首作业本身就会超过上限**时：
+  - 不派发该作业，且**本批次不向该租户发放 QUANTUM**（不可“刷”量子；等待释放仍按老化补偿）；
+  - 其他符合条件的租户**照常调度**，不受影响。
+- RUNNING 作业 `complete`、或在 RUNNING 状态被 `cancel` 后释放占用的 GPU，
+  后续批次即可再调度该租户；仅排队中取消不占额度、也不释放额度。
+- 容量约束与租户上限互不替代：即使集群空闲，超过本租户上限的队首作业同样等待
+  （提高上限后即可解除）。
+- 租户对象（`GET /tenants`、`GET /tenants/{id}`、`GET /scheduler/state`）与
+  `GET /queue` 的每个队列均返回 `gpu_cap`（`null` = 不限）与当前 `running_gpus`。
+
+```bash
+# 设置上限：team-a 最多并发占用 2 GPU
+curl -X POST http://localhost:8000/tenants \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"team-a","weight":1.0,"gpu_cap":2}'
+
+# 仅更新权重、省略 gpu_cap -> 保留原上限
+curl -X POST http://localhost:8000/tenants \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"team-a","weight":2.0}'
+
+# 清除上限（恢复不限额）
+curl -X POST http://localhost:8000/tenants \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"team-a","weight":2.0,"gpu_cap":null}'
+```
 
 ### 作业依赖（`depends_on`，DAG）
 
@@ -115,6 +153,10 @@ RUNNING 作业占用 GPU，直到 `complete`/`cancel` 才释放给后续批次�
 | `DB_PATH` | `/data/scheduler.db` | SQLite 文件路径 |
 
 提交时若 `gpus > CLUSTER_GPUS`（永远无法运行）会被拒绝（400）。
+
+> 租户级**并发 GPU 上限**不是环境变量，而按租户通过 `POST /tenants` 的
+> `gpu_cap` 字段配置（正整数设置、`null` 清除，默认不限额），详见上文
+> 「租户并发 GPU 上限」一节。
 
 ---
 
@@ -155,6 +197,24 @@ curl -X POST http://localhost:8000/jobs \
 #      "blocked_by":[{"id":"J000001","status":"QUEUED"}], ...}
 ```
 
+### 1b. 管理租户权重与并发 GPU 上限 `POST /tenants`
+
+单独创建/更新租户（提交作业也会自动注册租户）。字段：
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `tenant_id` | 是 | 非空租户标识 |
+| `weight` | 是 | 租户权重，必须 > 0 |
+| `gpu_cap` | 否 | 该租户 RUNNING 作业可并发占用的 GPU 上限：正整数设置、`null` 清除（不限额）；**省略则保留原值**。新建租户默认 `null`（不限额），`gpu_cap` ≤ 0 返回 422 |
+
+```bash
+curl -X POST http://localhost:8000/tenants \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"team-a","weight":1.0,"gpu_cap":2}'
+# 201 {"id":"team-a","weight":1.0,"balance_gpu_min":0.0,
+#      "gpu_cap":2,"queued_jobs":0,"running_jobs":0,"running_gpus":0, ...}
+```
+
 ### 2. 调度下一批 `POST /scheduler/batch`
 
 执行一次 WDRR + 老化批次，返回**选择顺序**、每租户**余额**、容量使用与完整事件流水：
@@ -176,8 +236,8 @@ curl -X POST http://localhost:8000/scheduler/batch
   "selection_order": ["J000001", "J000002"],
   "selected_jobs": [ { "id": "J000001", "run_index": 1, ... } ],
   "tenants": [
-    {"id":"team-a","weight":1.0,"balance_gpu_min":0.0,"queued_jobs":0,"running_jobs":1},
-    {"id":"team-b","weight":2.0,"balance_gpu_min":60.0,"queued_jobs":0,"running_jobs":1}
+    {"id":"team-a","weight":1.0,"balance_gpu_min":0.0,"gpu_cap":null,"running_gpus":2,"queued_jobs":0,"running_jobs":1},
+    {"id":"team-b","weight":2.0,"balance_gpu_min":60.0,"gpu_cap":null,"running_gpus":6,"queued_jobs":0,"running_jobs":1}
   ],
   "events": [
     {"kind":"AGING",  "tenant_id":"team-a", "amount":0.01, ...},
@@ -278,7 +338,7 @@ curl -G "http://localhost:8000/usage/gpu" \
 | GET | `/jobs/{id}` | 作业详情 |
 | POST | `/jobs/{id}/cancel` | 取消作业 |
 | POST | `/jobs/{id}/complete` | 完成运行中作业并释放 GPU |
-| POST | `/tenants` | 创建租户或更新权重 |
+| POST | `/tenants` | 创建租户或更新权重；可选 `gpu_cap` 设置/清除并发 GPU 上限（省略保留原值） |
 | GET | `/tenants` / `/tenants/{id}` | 租户与余额 |
 | POST | `/scheduler/batch` | **调度下一批**，返回选择顺序与余额 |
 | GET | `/scheduler/state` | 集群/调参/租户快照 |
@@ -316,6 +376,21 @@ curl -s localhost:8000/jobs/J000004                   # blocked_by 标明 J00000
 curl -s -X POST localhost:8000/jobs/J000003/complete
 curl -s -X POST localhost:8000/scheduler/batch        # => [J000004]
 
+# 租户并发 GPU 上限：erin 上限 2，J000005 占满后 J000006 不派发、不获量子；
+# 不受限的 frank 仍可调度；J000005 完成后 J000006 才放行
+curl -s -X POST localhost:8000/tenants -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"erin","weight":1,"gpu_cap":2}'
+curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"erin","gpus":2,"duration_min":10}'   # J000005
+curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"erin","gpus":1,"duration_min":10}'   # J000006
+curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"frank","gpus":2,"duration_min":10}'  # J000007
+curl -s -X POST localhost:8000/scheduler/batch           # => [J000005, J000007]
+curl -s -X POST localhost:8000/scheduler/batch           # => []（erin 占满上限）
+curl -s -X POST localhost:8000/jobs/J000005/complete
+curl -s -X POST localhost:8000/scheduler/batch           # => [J000006]
+
 # 按 UTC 时间窗汇总实际 GPU 用量（已结束作业取 scheduled_at→completed_at，
 # 仍 RUNNING 的作业截断到 end；QUEUED 不计；左闭右开）
 curl -s -G localhost:8000/usage/gpu \
@@ -332,7 +407,7 @@ curl -s -G localhost:8000/usage/gpu \
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 
-# 运行全部测试（37 个：服务层算法/依赖/用量汇总 + HTTP 端到端）
+# 运行全部测试（43 个：服务层算法/依赖/租户 GPU 上限/用量汇总 + HTTP 端到端）
 .venv/bin/python -m pytest -q
 
 # 无需第三方库的核心算法验证脚本（仅用标准库 sqlite3）
